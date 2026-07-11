@@ -34,6 +34,8 @@ const io = new Server(httpServer, {
   },
   pingInterval: 10000,
   pingTimeout: 5000,
+  allowEIO3: true,
+  transports: ["polling", "websocket"]
 });
 
 // Register all socket event handlers

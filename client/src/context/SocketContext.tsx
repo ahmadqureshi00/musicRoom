@@ -86,7 +86,7 @@ export function SocketProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     const url = getSocketUrl();
     const newSocket = io(url, {
-      transports: ["websocket", "polling"],
+      transports: ["polling", "websocket"],
       autoConnect: true,
     });
 
