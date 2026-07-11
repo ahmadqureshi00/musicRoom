@@ -14,6 +14,7 @@ const httpServer = createServer(app);
 const ALLOWED_ORIGINS = [
   "http://localhost:3000", // Next.js dev
   "http://127.0.0.1:3000",
+  "https://music-room-ashen.vercel.app"
 ];
 
 app.use(
