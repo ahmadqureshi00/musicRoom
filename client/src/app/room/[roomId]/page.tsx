@@ -5,7 +5,7 @@
 
 import React, { useState, useCallback, useEffect, useRef } from "react";
 import { useParams } from "next/navigation";
-import { SocketProvider, useSocketContext } from "@/context/SocketContext";
+import { useSocketContext } from "@/context/SocketContext";
 import YouTubePlayer from "@/components/YouTubePlayer";
 import MediaControls from "@/components/MediaControls";
 import GuestList from "@/components/GuestList";
@@ -43,11 +43,12 @@ export default function RoomPage() {
   // Player control ref — set by YouTubePlayer, used by MediaControls
   const playerControlRef = useRef<PlayerControlRef | null>(null);
 
-  // If we navigated here without room state (e.g. direct URL),
-  // show message to go back
+  // Wait for room state — either from navigation (createRoom/joinRoom)
+  // or from auto-rejoin on page refresh. Give it 10s before showing error.
   useEffect(() => {
     if (roomState) {
       setIsLoading(false);
+      setError("");
       if (!isHost) {
         setShowSyncOverlay(true);
       }
@@ -57,7 +58,7 @@ export default function RoomPage() {
           setIsLoading(false);
           setError("no_state");
         }
-      }, 3000);
+      }, 10000); // 10s — enough time for socket reconnect + rejoin
       return () => clearTimeout(timer);
     }
   }, [roomState, isHost]);

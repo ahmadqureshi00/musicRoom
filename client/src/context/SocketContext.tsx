@@ -1,7 +1,8 @@
 "use client";
 
 // ─── Socket Context ───────────────────────────────────────────
-// Centralized Socket.io connection provider for the app.
+// Centralized Socket.io connection provider with session recovery.
+// Stores sessionId + room info in sessionStorage to survive page refreshes.
 
 import React, {
   createContext,
@@ -44,6 +45,7 @@ interface SocketContextType {
   isConnected: boolean;
   roomState: RoomState | null;
   isHost: boolean;
+  sessionId: string;
   createRoom: (hostName: string) => Promise<string>;
   joinRoom: (roomId: string, guestName: string) => Promise<boolean>;
   emitSyncAction: (
@@ -66,12 +68,52 @@ const SocketContext = createContext<SocketContextType | null>(null);
 // ─── Server URL ──────────────────────────────────────────────
 // Use window.location.hostname to ensure it works when accessed from other devices on the local network.
 const getSocketUrl = () => {
-  if (process.env.NEXT_PUBLIC_SOCKET_URL) return process.env.NEXT_PUBLIC_SOCKET_URL;
+  if (process.env.NEXT_PUBLIC_SOCKET_URL)
+    return process.env.NEXT_PUBLIC_SOCKET_URL;
   if (typeof window !== "undefined") {
     return `http://${window.location.hostname}:3000`;
   }
   return "http://localhost:3000";
 };
+
+// ─── Session Storage Helpers ─────────────────────────────────
+
+const SESSION_KEY = "musicroom_session";
+
+interface StoredSession {
+  sessionId: string;
+  roomId: string;
+  displayName: string;
+  isHost: boolean;
+}
+
+function getStoredSession(): StoredSession | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = sessionStorage.getItem(SESSION_KEY);
+    if (!raw) return null;
+    return JSON.parse(raw) as StoredSession;
+  } catch {
+    return null;
+  }
+}
+
+function saveSession(data: StoredSession): void {
+  if (typeof window === "undefined") return;
+  sessionStorage.setItem(SESSION_KEY, JSON.stringify(data));
+}
+
+function clearSession(): void {
+  if (typeof window === "undefined") return;
+  sessionStorage.removeItem(SESSION_KEY);
+}
+
+function getOrCreateSessionId(): string {
+  if (typeof window === "undefined") return crypto.randomUUID();
+  const stored = getStoredSession();
+  if (stored?.sessionId) return stored.sessionId;
+  return crypto.randomUUID();
+}
 
 // ─── Provider ────────────────────────────────────────────────
 
@@ -81,6 +123,13 @@ export function SocketProvider({ children }: { children: React.ReactNode }) {
   const [roomState, setRoomState] = useState<RoomState | null>(null);
   const [isHost, setIsHost] = useState(false);
   const socketRef = useRef<Socket | null>(null);
+
+  // Stable sessionId — generated once, reused across reconnections
+  const sessionIdRef = useRef<string>(getOrCreateSessionId());
+  const sessionId = sessionIdRef.current;
+
+  // Track whether we've already attempted a rejoin (to prevent loops)
+  const rejoinAttemptedRef = useRef(false);
 
   // Initialize socket connection
   useEffect(() => {
@@ -93,6 +142,44 @@ export function SocketProvider({ children }: { children: React.ReactNode }) {
     newSocket.on("connect", () => {
       console.log("[Socket] Connected:", newSocket.id);
       setIsConnected(true);
+
+      // ─── Auto-rejoin on reconnect ─────────────────────────
+      // If we have saved session info, try to rejoin the room
+      const stored = getStoredSession();
+      if (stored && stored.sessionId === sessionId && !rejoinAttemptedRef.current) {
+        rejoinAttemptedRef.current = true;
+        console.log(
+          `[Socket] Attempting auto-rejoin: room=${stored.roomId}, session=${stored.sessionId}`
+        );
+
+        newSocket.emit(
+          "rejoin_room",
+          { sessionId: stored.sessionId, roomId: stored.roomId },
+          (response: {
+            success: boolean;
+            room?: RoomState;
+            isHost?: boolean;
+            error?: string;
+          }) => {
+            if (response.success && response.room) {
+              console.log("[Socket] Auto-rejoin successful!");
+              setRoomState(response.room);
+              setIsHost(response.isHost ?? false);
+            } else {
+              console.log(
+                "[Socket] Auto-rejoin failed:",
+                response.error
+              );
+              clearSession();
+            }
+            // Allow future rejoin attempts (e.g. if socket disconnects and reconnects again)
+            rejoinAttemptedRef.current = false;
+          }
+        );
+      } else {
+        // Reset for next reconnect cycle
+        rejoinAttemptedRef.current = false;
+      }
     });
 
     newSocket.on("disconnect", () => {
@@ -156,7 +243,7 @@ export function SocketProvider({ children }: { children: React.ReactNode }) {
       newSocket.removeAllListeners();
       newSocket.disconnect();
     };
-  }, []);
+  }, [sessionId]);
 
   // ─── Actions ───────────────────────────────────────────────
 
@@ -169,7 +256,7 @@ export function SocketProvider({ children }: { children: React.ReactNode }) {
         }
         socketRef.current.emit(
           "create_room",
-          { hostName },
+          { hostName, sessionId },
           (response: {
             success: boolean;
             roomId?: string;
@@ -179,6 +266,15 @@ export function SocketProvider({ children }: { children: React.ReactNode }) {
             if (response.success && response.room && response.roomId) {
               setRoomState(response.room);
               setIsHost(true);
+
+              // Save to sessionStorage for recovery
+              saveSession({
+                sessionId,
+                roomId: response.roomId,
+                displayName: hostName,
+                isHost: true,
+              });
+
               resolve(response.roomId);
             } else {
               reject(new Error(response.error || "Failed to create room"));
@@ -187,7 +283,7 @@ export function SocketProvider({ children }: { children: React.ReactNode }) {
         );
       });
     },
-    []
+    [sessionId]
   );
 
   const joinRoom = useCallback(
@@ -199,7 +295,7 @@ export function SocketProvider({ children }: { children: React.ReactNode }) {
         }
         socketRef.current.emit(
           "join_room",
-          { roomId, guestName },
+          { roomId, guestName, sessionId },
           (response: {
             success: boolean;
             room?: RoomState;
@@ -208,6 +304,15 @@ export function SocketProvider({ children }: { children: React.ReactNode }) {
             if (response.success && response.room) {
               setRoomState(response.room);
               setIsHost(false);
+
+              // Save to sessionStorage for recovery
+              saveSession({
+                sessionId,
+                roomId,
+                displayName: guestName,
+                isHost: false,
+              });
+
               resolve(true);
             } else {
               reject(new Error(response.error || "Failed to join room"));
@@ -216,7 +321,7 @@ export function SocketProvider({ children }: { children: React.ReactNode }) {
         );
       });
     },
-    []
+    [sessionId]
   );
 
   const emitSyncAction = useCallback(
@@ -287,6 +392,7 @@ export function SocketProvider({ children }: { children: React.ReactNode }) {
         isConnected,
         roomState,
         isHost,
+        sessionId,
         createRoom,
         joinRoom,
         emitSyncAction,

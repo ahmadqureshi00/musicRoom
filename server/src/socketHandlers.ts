@@ -1,5 +1,6 @@
 // ─── Socket Event Handlers ────────────────────────────────────
 // All Socket.io event handlers, wired up in a single function.
+// Includes session recovery support for graceful page refreshes.
 
 import { Server, Socket } from "socket.io";
 import {
@@ -13,6 +14,8 @@ import {
   changeTrack,
   addToQueue,
   popFromQueue,
+  markDisconnected,
+  rejoinRoom,
 } from "./roomManager";
 
 export function registerSocketHandlers(io: Server): void {
@@ -23,11 +26,20 @@ export function registerSocketHandlers(io: Server): void {
     socket.on(
       "create_room",
       (
-        data: { hostName: string },
-        callback: (response: { success: boolean; roomId?: string; room?: any; error?: string }) => void
+        data: { hostName: string; sessionId: string },
+        callback: (response: {
+          success: boolean;
+          roomId?: string;
+          room?: any;
+          error?: string;
+        }) => void
       ) => {
         try {
-          const room = createRoom(socket.id, data.hostName || "Host");
+          const room = createRoom(
+            socket.id,
+            data.hostName || "Host",
+            data.sessionId
+          );
           socket.join(room.id);
 
           callback({
@@ -46,14 +58,19 @@ export function registerSocketHandlers(io: Server): void {
     socket.on(
       "join_room",
       (
-        data: { roomId: string; guestName: string },
-        callback: (response: { success: boolean; room?: any; error?: string }) => void
+        data: { roomId: string; guestName: string; sessionId: string },
+        callback: (response: {
+          success: boolean;
+          room?: any;
+          error?: string;
+        }) => void
       ) => {
         try {
           const room = joinRoom(
             data.roomId,
             socket.id,
-            data.guestName || "Guest"
+            data.guestName || "Guest",
+            data.sessionId
           );
 
           if (!room) {
@@ -80,6 +97,61 @@ export function registerSocketHandlers(io: Server): void {
         } catch (err) {
           console.error("[Socket] join_room error:", err);
           callback({ success: false, error: "Failed to join room" });
+        }
+      }
+    );
+
+    // ─── Rejoin Room (Session Recovery) ──────────────────────
+    socket.on(
+      "rejoin_room",
+      (
+        data: { sessionId: string; roomId: string },
+        callback: (response: {
+          success: boolean;
+          room?: any;
+          isHost?: boolean;
+          error?: string;
+        }) => void
+      ) => {
+        try {
+          const result = rejoinRoom(data.sessionId, socket.id, data.roomId);
+
+          if (!result) {
+            callback({
+              success: false,
+              error: "Room not found or session expired",
+            });
+            return;
+          }
+
+          const { room, isHost } = result;
+
+          // Join the Socket.io room
+          socket.join(room.id);
+
+          const snapshot = roomToSnapshot(room);
+
+          // Send full state back to the reconnecting user
+          callback({
+            success: true,
+            room: snapshot,
+            isHost,
+          });
+
+          // Notify other participants that someone reconnected
+          socket.to(room.id).emit("guest_list_update", {
+            guests: snapshot.guests,
+          });
+
+          console.log(
+            `[Socket] Session ${data.sessionId} rejoined room ${room.id} via socket ${socket.id}`
+          );
+        } catch (err) {
+          console.error("[Socket] rejoin_room error:", err);
+          callback({
+            success: false,
+            error: "Failed to rejoin room",
+          });
         }
       }
     );
@@ -169,7 +241,10 @@ export function registerSocketHandlers(io: Server): void {
       "queue_add",
       (
         data: { videoId: string; title: string },
-        callback?: (response: { success: boolean; error?: string }) => void
+        callback?: (response: {
+          success: boolean;
+          error?: string;
+        }) => void
       ) => {
         const room = findRoomBySocket(socket.id);
         if (!room) {
@@ -215,35 +290,27 @@ export function registerSocketHandlers(io: Server): void {
       io.to(room.id).emit("queue_update", { queue: snapshot.queue });
     });
 
-    // ─── Disconnect ──────────────────────────────────────────
+    // ─── Disconnect (Graceful with Grace Period) ─────────────
     socket.on("disconnect", () => {
       console.log(`[Socket] Disconnected: ${socket.id}`);
 
-      const result = leaveRoom(socket.id);
+      // Use grace period instead of immediate removal
+      const result = markDisconnected(socket.id);
       if (!result) return;
 
-      const { room, wasHost, newHostId, isEmpty } = result;
+      const { roomId } = result;
+      const room = getRoom(roomId);
+      if (!room) return;
 
-      if (isEmpty) return; // Room already deleted
-
+      // Update guest list for remaining participants (user disappears temporarily)
       const snapshot = roomToSnapshot(room);
-
-      // Notify remaining participants of updated guest list
       io.to(room.id).emit("guest_list_update", {
         guests: snapshot.guests,
       });
 
-      io.to(room.id).emit("user_left", {
-        socketId: socket.id,
-      });
-
-      // If host departed, notify the new host
-      if (wasHost && newHostId) {
-        io.to(room.id).emit("host_changed", {
-          newHostId: newHostId,
-          hostName: room.hostName,
-        });
-      }
+      // Note: We do NOT emit host_changed here. The grace period timer
+      // in roomManager handles host promotion if the timer expires.
+      // If the user reconnects within 15s, they get their host status back.
     });
   });
 }
