@@ -33,6 +33,7 @@ export default function YouTubePlayer({
     isHost,
     emitSyncAction,
     emitHostState,
+    getServerTimeOffset,
   } = useSocketContext();
 
   // Sync guard: prevents re-emitting events triggered by remote sync
@@ -114,19 +115,28 @@ export default function YouTubePlayer({
     const handleSyncAction = (data: {
       action: "PLAY" | "PAUSE" | "SEEK";
       currentTime: number;
+      serverTime?: number;
     }) => {
       if (!isReady) return;
 
       isSyncingRef.current = true;
 
+      let targetTime = data.currentTime;
+      // Add latency compensation for playback and seeking
+      if (data.serverTime && (data.action === "PLAY" || data.action === "SEEK")) {
+        const offset = getServerTimeOffset();
+        const elapsed = (Date.now() - data.serverTime - offset) / 1000;
+        targetTime += Math.max(0, elapsed); // add elapsed seconds since server stamped it
+      }
+
       if (data.action === "PLAY") {
-        seekTo(data.currentTime);
+        seekTo(targetTime);
         playVideo();
       } else if (data.action === "PAUSE") {
         pauseVideo();
-        seekTo(data.currentTime);
+        seekTo(targetTime);
       } else if (data.action === "SEEK") {
-        seekTo(data.currentTime);
+        seekTo(targetTime);
       }
 
       setTimeout(() => {
@@ -138,16 +148,25 @@ export default function YouTubePlayer({
       currentTime: number;
       isPlaying: boolean;
       videoId: string | null;
+      serverTime?: number;
     }) => {
       if (!isReady) return;
 
-      const localTime = getCurrentTime();
-      const drift = Math.abs(localTime - data.currentTime);
+      let hostTime = data.currentTime;
+      // Add latency compensation if playing
+      if (data.serverTime && data.isPlaying) {
+        const offset = getServerTimeOffset();
+        const elapsed = (Date.now() - data.serverTime - offset) / 1000;
+        hostTime += Math.max(0, elapsed);
+      }
 
-      // Only correct if drift exceeds 1 second
-      if (drift > 1) {
+      const localTime = getCurrentTime();
+      const drift = Math.abs(localTime - hostTime);
+
+      // Only correct if drift exceeds 0.5 seconds (tightened from 1s)
+      if (drift > 0.5) {
         isSyncingRef.current = true;
-        seekTo(data.currentTime);
+        seekTo(hostTime);
         setTimeout(() => {
           isSyncingRef.current = false;
         }, 500);
@@ -185,6 +204,7 @@ export default function YouTubePlayer({
     pauseVideo,
     getCurrentTime,
     playerState,
+    getServerTimeOffset,
   ]);
 
   // ─── Host: respond to sync requests ────────────────────────
@@ -214,13 +234,13 @@ export default function YouTubePlayer({
     emitHostState,
   ]);
 
-  // ─── Guest: periodic drift correction (every 5 seconds) ───
+  // ─── Guest: periodic drift correction (every 3 seconds) ───
   useEffect(() => {
     if (!socket || isHost || !isReady) return;
 
     const interval = setInterval(() => {
       socket.emit("request_sync");
-    }, 5000);
+    }, 3000);
 
     return () => clearInterval(interval);
   }, [socket, isHost, isReady]);

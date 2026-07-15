@@ -46,6 +46,7 @@ interface SocketContextType {
   roomState: RoomState | null;
   isHost: boolean;
   sessionId: string;
+  getServerTimeOffset: () => number;
   createRoom: (hostName: string) => Promise<string>;
   joinRoom: (roomId: string, guestName: string) => Promise<boolean>;
   emitSyncAction: (
@@ -131,6 +132,16 @@ export function SocketProvider({ children }: { children: React.ReactNode }) {
   // Track whether we've already attempted a rejoin (to prevent loops)
   const rejoinAttemptedRef = useRef(false);
 
+  // ─── Clock Synchronization ───────────────────────────────
+  const clockOffsetsRef = useRef<number[]>([]);
+  
+  const getServerTimeOffset = useCallback(() => {
+    const offsets = clockOffsetsRef.current;
+    if (offsets.length === 0) return 0;
+    // Return average offset
+    return offsets.reduce((a, b) => a + b, 0) / offsets.length;
+  }, []);
+
   // Initialize socket connection
   useEffect(() => {
     const url = getSocketUrl();
@@ -180,6 +191,27 @@ export function SocketProvider({ children }: { children: React.ReactNode }) {
         // Reset for next reconnect cycle
         rejoinAttemptedRef.current = false;
       }
+    });
+
+    let pingInterval: NodeJS.Timeout;
+
+    const measureClockOffset = () => {
+      const clientTime = Date.now();
+      newSocket.emit("ping_sync", { clientTime }, (response: { serverTime: number }) => {
+        const now = Date.now();
+        const rtt = now - clientTime;
+        const offset = response.serverTime - (clientTime + rtt / 2);
+        
+        clockOffsetsRef.current.push(offset);
+        if (clockOffsetsRef.current.length > 5) {
+          clockOffsetsRef.current.shift();
+        }
+      });
+    };
+
+    newSocket.on("connect", () => {
+      measureClockOffset();
+      pingInterval = setInterval(measureClockOffset, 10000);
     });
 
     newSocket.on("disconnect", () => {
@@ -240,6 +272,7 @@ export function SocketProvider({ children }: { children: React.ReactNode }) {
     setSocket(newSocket);
 
     return () => {
+      clearInterval(pingInterval);
       newSocket.removeAllListeners();
       newSocket.disconnect();
     };
@@ -393,6 +426,7 @@ export function SocketProvider({ children }: { children: React.ReactNode }) {
         roomState,
         isHost,
         sessionId,
+        getServerTimeOffset,
         createRoom,
         joinRoom,
         emitSyncAction,

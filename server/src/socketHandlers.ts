@@ -22,6 +22,11 @@ export function registerSocketHandlers(io: Server): void {
   io.on("connection", (socket: Socket) => {
     console.log(`[Socket] Connected: ${socket.id}`);
 
+    // ─── Clock Synchronization ───────────────────────────────
+    socket.on("ping_sync", (data: { clientTime: number }, callback) => {
+      callback({ serverTime: Date.now() });
+    });
+
     // ─── Create Room ─────────────────────────────────────────
     socket.on(
       "create_room",
@@ -195,6 +200,7 @@ export function registerSocketHandlers(io: Server): void {
         socket.to(room.id).emit("sync_action", {
           action: data.action,
           currentTime: data.currentTime,
+          serverTime: Date.now(),
         });
       }
     );
@@ -232,6 +238,7 @@ export function registerSocketHandlers(io: Server): void {
           currentTime: data.currentTime,
           isPlaying: data.isPlaying,
           videoId: data.videoId,
+          serverTime: Date.now(),
         });
       }
     );
