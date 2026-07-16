@@ -33,6 +33,7 @@ interface UseYouTubePlayerReturn {
   seekTo: (seconds: number) => void;
   loadVideo: (videoId: string) => void;
   getCurrentTime: () => number;
+  setPlaybackRate: (rate: number) => void;
 }
 
 // Track if the API script is already loading/loaded globally
@@ -196,6 +197,14 @@ export function useYouTubePlayer({
     }
   }, []);
 
+  const setPlaybackRate = useCallback((rate: number) => {
+    try {
+      playerRef.current?.setPlaybackRate(rate);
+    } catch {
+      // Ignore errors from destroyed player
+    }
+  }, []);
+
   return {
     player: playerRef.current,
     isReady,
@@ -207,5 +216,6 @@ export function useYouTubePlayer({
     seekTo,
     loadVideo,
     getCurrentTime,
+    setPlaybackRate,
   };
 }

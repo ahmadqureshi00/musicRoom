@@ -1,5 +1,6 @@
 // ─── Socket Event Handlers ────────────────────────────────────
 // All Socket.io event handlers, wired up in a single function.
+// Implements BeatSync-grade coordinated execution for perfect sync.
 // Includes session recovery support for graceful page refreshes.
 
 import { Server, Socket } from "socket.io";
@@ -18,14 +19,56 @@ import {
   rejoinRoom,
 } from "./roomManager";
 
+// ─── RTT Tracking ────────────────────────────────────────────
+// Per-socket RTT measurements for adaptive buffer calculation
+const socketRTTs = new Map<string, number>();
+
+const MIN_BUFFER_MS = 150;
+const MAX_BUFFER_MS = 500;
+const DEFAULT_BUFFER_MS = 250;
+
+/**
+ * Calculate the optimal execution buffer for a room based on
+ * the maximum RTT of all connected clients.
+ */
+function getRoomBuffer(roomId: string): number {
+  const room = getRoom(roomId);
+  if (!room) return DEFAULT_BUFFER_MS;
+
+  let maxRTT = 0;
+  for (const [socketId] of room.guests) {
+    const rtt = socketRTTs.get(socketId);
+    if (rtt && rtt > maxRTT) {
+      maxRTT = rtt;
+    }
+  }
+
+  // Buffer = maxRTT + 50ms headroom, clamped to [MIN, MAX]
+  const buffer = Math.min(MAX_BUFFER_MS, Math.max(MIN_BUFFER_MS, maxRTT + 50));
+  return buffer;
+}
+
 export function registerSocketHandlers(io: Server): void {
   io.on("connection", (socket: Socket) => {
     console.log(`[Socket] Connected: ${socket.id}`);
 
-    // ─── Clock Synchronization ───────────────────────────────
-    socket.on("ping_sync", (data: { clientTime: number }, callback) => {
-      callback({ serverTime: Date.now() });
-    });
+    // ─── Clock Synchronization (NTP-like) ────────────────────
+    // Client sends clientTime, we respond with serverTime.
+    // Client also reports its measured RTT so we can track room-wide latency.
+    socket.on(
+      "ping_sync",
+      (
+        data: { clientTime: number; rtt?: number },
+        callback: (response: { serverTime: number }) => void
+      ) => {
+        // Store client-reported RTT if provided
+        if (data.rtt !== undefined && data.rtt > 0) {
+          socketRTTs.set(socket.id, data.rtt);
+        }
+
+        callback({ serverTime: Date.now() });
+      }
+    );
 
     // ─── Create Room ─────────────────────────────────────────
     socket.on(
@@ -178,29 +221,89 @@ export function registerSocketHandlers(io: Server): void {
       }
     );
 
-    // ─── Sync Action (Host only) ────────────────────────────
-    // The core sync mechanism: host broadcasts PLAY/PAUSE/SEEK
+    // ═══════════════════════════════════════════════════════════
+    // ─── COORDINATED EXECUTION: Intent → Execute ─────────────
+    // ═══════════════════════════════════════════════════════════
+    //
+    // Instead of immediately broadcasting sync events, the host
+    // sends an "intent" and the server schedules a coordinated
+    // execution moment in the future so all clients (including
+    // the host) execute simultaneously.
+
+    // ─── Intent Play (Host only) ─────────────────────────────
     socket.on(
-      "sync_action",
-      (data: {
-        action: "PLAY" | "PAUSE" | "SEEK";
-        currentTime: number;
-      }) => {
+      "intent_play",
+      (data: { mediaTime: number }) => {
         const room = findRoomBySocket(socket.id);
         if (!room || room.hostId !== socket.id) return;
 
+        const buffer = getRoomBuffer(room.id);
+        const executeAtServerTime = Date.now() + buffer;
+
         // Update server-side state
-        updatePlaybackState(
-          room.id,
-          data.currentTime,
-          data.action === "PLAY" || data.action === "SEEK"
+        updatePlaybackState(room.id, data.mediaTime, true);
+
+        console.log(
+          `[Sync] intent_play in room ${room.id}: mediaTime=${data.mediaTime.toFixed(2)}s, buffer=${buffer}ms, executeAt=${executeAtServerTime}`
         );
 
-        // Broadcast to all OTHER clients in the room (not back to host)
-        socket.to(room.id).emit("sync_action", {
-          action: data.action,
-          currentTime: data.currentTime,
-          serverTime: Date.now(),
+        // Broadcast to ALL clients in the room (including host)
+        io.to(room.id).emit("execute_playback", {
+          action: "PLAY",
+          mediaTime: data.mediaTime,
+          executeAtServerTime,
+        });
+      }
+    );
+
+    // ─── Intent Pause (Host only) ────────────────────────────
+    socket.on(
+      "intent_pause",
+      (data: { mediaTime: number }) => {
+        const room = findRoomBySocket(socket.id);
+        if (!room || room.hostId !== socket.id) return;
+
+        const buffer = getRoomBuffer(room.id);
+        const executeAtServerTime = Date.now() + buffer;
+
+        // Update server-side state
+        updatePlaybackState(room.id, data.mediaTime, false);
+
+        console.log(
+          `[Sync] intent_pause in room ${room.id}: mediaTime=${data.mediaTime.toFixed(2)}s, buffer=${buffer}ms`
+        );
+
+        // Broadcast to ALL clients (including host)
+        io.to(room.id).emit("execute_playback", {
+          action: "PAUSE",
+          mediaTime: data.mediaTime,
+          executeAtServerTime,
+        });
+      }
+    );
+
+    // ─── Intent Seek (Host only) ─────────────────────────────
+    socket.on(
+      "intent_seek",
+      (data: { mediaTime: number }) => {
+        const room = findRoomBySocket(socket.id);
+        if (!room || room.hostId !== socket.id) return;
+
+        const buffer = getRoomBuffer(room.id);
+        const executeAtServerTime = Date.now() + buffer;
+
+        // Update server-side state
+        updatePlaybackState(room.id, data.mediaTime, room.isPlaying);
+
+        console.log(
+          `[Sync] intent_seek in room ${room.id}: mediaTime=${data.mediaTime.toFixed(2)}s, buffer=${buffer}ms`
+        );
+
+        // Broadcast to ALL clients (including host)
+        io.to(room.id).emit("execute_playback", {
+          action: "SEEK",
+          mediaTime: data.mediaTime,
+          executeAtServerTime,
         });
       }
     );
@@ -218,7 +321,7 @@ export function registerSocketHandlers(io: Server): void {
     });
 
     // ─── Host State Response ─────────────────────────────────
-    // Host responds with their current state
+    // Host responds with their current state (for periodic drift correction)
     socket.on(
       "host_state",
       (data: {
@@ -233,7 +336,7 @@ export function registerSocketHandlers(io: Server): void {
         // Update server state
         updatePlaybackState(room.id, data.currentTime, data.isPlaying);
 
-        // Send directly to the requesting guest
+        // Send directly to the requesting guest with server timestamp
         io.to(data.requesterId).emit("host_state", {
           currentTime: data.currentTime,
           isPlaying: data.isPlaying,
@@ -300,6 +403,9 @@ export function registerSocketHandlers(io: Server): void {
     // ─── Disconnect (Graceful with Grace Period) ─────────────
     socket.on("disconnect", () => {
       console.log(`[Socket] Disconnected: ${socket.id}`);
+
+      // Clean up RTT tracking
+      socketRTTs.delete(socket.id);
 
       // Use grace period instead of immediate removal
       const result = markDisconnected(socket.id);

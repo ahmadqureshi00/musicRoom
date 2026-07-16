@@ -29,7 +29,7 @@ export default function MediaControls({
   const {
     isHost,
     roomState,
-    emitSyncAction,
+    emitIntentSeek,
     emitTrackChanged,
     emitPlayNext,
   } = useSocketContext();
@@ -71,8 +71,8 @@ export default function MediaControls({
     setIsSeeking(false);
     const seekTime = (seekValue / 100) * duration;
     onSeek(seekTime);
-    emitSyncAction("SEEK", seekTime);
-  }, [isHost, seekValue, duration, onSeek, emitSyncAction]);
+    emitIntentSeek(seekTime);
+  }, [isHost, seekValue, duration, onSeek, emitIntentSeek]);
 
   // ─── Load URL ──────────────────────────────────────────────
   const handleLoadUrl = useCallback(

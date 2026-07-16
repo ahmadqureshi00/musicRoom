@@ -1,8 +1,11 @@
 "use client";
 
 // ─── Socket Context ───────────────────────────────────────────
-// Centralized Socket.io connection provider with session recovery.
-// Stores sessionId + room info in sessionStorage to survive page refreshes.
+// Centralized Socket.io connection provider with:
+// - NTP-like clock synchronization (median of 5 samples, 5s interval)
+// - Session recovery via sessionStorage
+// - Coordinated execution: intent_* events instead of direct sync
+// - RTT reporting to server for adaptive buffer sizing
 
 import React, {
   createContext,
@@ -40,19 +43,26 @@ export interface RoomState {
   guests: GuestInfo[];
 }
 
+// ─── Execute Playback Event Type ─────────────────────────────
+export interface ExecutePlaybackEvent {
+  action: "PLAY" | "PAUSE" | "SEEK";
+  mediaTime: number;
+  executeAtServerTime: number;
+}
+
 interface SocketContextType {
   socket: Socket | null;
   isConnected: boolean;
   roomState: RoomState | null;
   isHost: boolean;
   sessionId: string;
+  getCurrentServerTime: () => number;
   getServerTimeOffset: () => number;
   createRoom: (hostName: string) => Promise<string>;
   joinRoom: (roomId: string, guestName: string) => Promise<boolean>;
-  emitSyncAction: (
-    action: "PLAY" | "PAUSE" | "SEEK",
-    currentTime: number
-  ) => void;
+  emitIntentPlay: (mediaTime: number) => void;
+  emitIntentPause: (mediaTime: number) => void;
+  emitIntentSeek: (mediaTime: number) => void;
   emitTrackChanged: (videoId: string, title: string) => void;
   emitQueueAdd: (videoId: string, title: string) => Promise<boolean>;
   emitPlayNext: () => void;
@@ -67,7 +77,6 @@ interface SocketContextType {
 const SocketContext = createContext<SocketContextType | null>(null);
 
 // ─── Server URL ──────────────────────────────────────────────
-// Use window.location.hostname to ensure it works when accessed from other devices on the local network.
 const getSocketUrl = () => {
   if (process.env.NEXT_PUBLIC_SOCKET_URL)
     return process.env.NEXT_PUBLIC_SOCKET_URL;
@@ -132,15 +141,25 @@ export function SocketProvider({ children }: { children: React.ReactNode }) {
   // Track whether we've already attempted a rejoin (to prevent loops)
   const rejoinAttemptedRef = useRef(false);
 
-  // ─── Clock Synchronization ───────────────────────────────
+  // ─── NTP-Like Clock Synchronization ────────────────────────
+  // Store raw offset samples. Use MEDIAN for robustness against outliers.
   const clockOffsetsRef = useRef<number[]>([]);
-  
+  const lastRTTRef = useRef<number>(0);
+
   const getServerTimeOffset = useCallback(() => {
     const offsets = clockOffsetsRef.current;
     if (offsets.length === 0) return 0;
-    // Return average offset
-    return offsets.reduce((a, b) => a + b, 0) / offsets.length;
+    // Return median offset (robust against network spikes)
+    const sorted = [...offsets].sort((a, b) => a - b);
+    const mid = Math.floor(sorted.length / 2);
+    return sorted.length % 2 !== 0
+      ? sorted[mid]
+      : (sorted[mid - 1] + sorted[mid]) / 2;
   }, []);
+
+  const getCurrentServerTime = useCallback(() => {
+    return Date.now() + getServerTimeOffset();
+  }, [getServerTimeOffset]);
 
   // Initialize socket connection
   useEffect(() => {
@@ -155,7 +174,6 @@ export function SocketProvider({ children }: { children: React.ReactNode }) {
       setIsConnected(true);
 
       // ─── Auto-rejoin on reconnect ─────────────────────────
-      // If we have saved session info, try to rejoin the room
       const stored = getStoredSession();
       if (stored && stored.sessionId === sessionId && !rejoinAttemptedRef.current) {
         rejoinAttemptedRef.current = true;
@@ -183,35 +201,46 @@ export function SocketProvider({ children }: { children: React.ReactNode }) {
               );
               clearSession();
             }
-            // Allow future rejoin attempts (e.g. if socket disconnects and reconnects again)
             rejoinAttemptedRef.current = false;
           }
         );
       } else {
-        // Reset for next reconnect cycle
         rejoinAttemptedRef.current = false;
       }
     });
 
+    // ─── Clock Sync Ping Loop ────────────────────────────────
     let pingInterval: NodeJS.Timeout;
 
     const measureClockOffset = () => {
       const clientTime = Date.now();
-      newSocket.emit("ping_sync", { clientTime }, (response: { serverTime: number }) => {
-        const now = Date.now();
-        const rtt = now - clientTime;
-        const offset = response.serverTime - (clientTime + rtt / 2);
-        
-        clockOffsetsRef.current.push(offset);
-        if (clockOffsetsRef.current.length > 5) {
-          clockOffsetsRef.current.shift();
+      newSocket.emit(
+        "ping_sync",
+        { clientTime, rtt: lastRTTRef.current },
+        (response: { serverTime: number }) => {
+          const now = Date.now();
+          const rtt = now - clientTime;
+          const offset = response.serverTime - (clientTime + rtt / 2);
+
+          lastRTTRef.current = rtt;
+
+          clockOffsetsRef.current.push(offset);
+          // Keep last 5 samples
+          if (clockOffsetsRef.current.length > 5) {
+            clockOffsetsRef.current.shift();
+          }
+
+          console.log(
+            `[ClockSync] RTT=${rtt}ms, offset=${offset.toFixed(1)}ms, median=${getServerTimeOffset().toFixed(1)}ms`
+          );
         }
-      });
+      );
     };
 
+    // Start clock sync immediately and every 5 seconds
     newSocket.on("connect", () => {
       measureClockOffset();
-      pingInterval = setInterval(measureClockOffset, 10000);
+      pingInterval = setInterval(measureClockOffset, 5000);
     });
 
     newSocket.on("disconnect", () => {
@@ -268,6 +297,21 @@ export function SocketProvider({ children }: { children: React.ReactNode }) {
       }
     );
 
+    // ─── Execute Playback (Coordinated Sync) ─────────────────
+    // Update local room state when execute_playback is received
+    // (the actual player scheduling is handled in YouTubePlayer)
+    newSocket.on("execute_playback", (data: ExecutePlaybackEvent) => {
+      setRoomState((prev) =>
+        prev
+          ? {
+              ...prev,
+              currentTime: data.mediaTime,
+              isPlaying: data.action !== "PAUSE",
+            }
+          : null
+      );
+    });
+
     socketRef.current = newSocket;
     setSocket(newSocket);
 
@@ -276,7 +320,7 @@ export function SocketProvider({ children }: { children: React.ReactNode }) {
       newSocket.removeAllListeners();
       newSocket.disconnect();
     };
-  }, [sessionId]);
+  }, [sessionId, getServerTimeOffset]);
 
   // ─── Actions ───────────────────────────────────────────────
 
@@ -357,20 +401,27 @@ export function SocketProvider({ children }: { children: React.ReactNode }) {
     [sessionId]
   );
 
-  const emitSyncAction = useCallback(
-    (action: "PLAY" | "PAUSE" | "SEEK", currentTime: number) => {
-      socketRef.current?.emit("sync_action", { action, currentTime });
+  // ─── Coordinated Intent Emitters ───────────────────────────
+  // These do NOT update local state immediately.
+  // The host waits for the execute_playback echo like everyone else.
 
-      // Update local state too
-      setRoomState((prev) =>
-        prev
-          ? {
-              ...prev,
-              currentTime,
-              isPlaying: action !== "PAUSE",
-            }
-          : null
-      );
+  const emitIntentPlay = useCallback(
+    (mediaTime: number) => {
+      socketRef.current?.emit("intent_play", { mediaTime });
+    },
+    []
+  );
+
+  const emitIntentPause = useCallback(
+    (mediaTime: number) => {
+      socketRef.current?.emit("intent_pause", { mediaTime });
+    },
+    []
+  );
+
+  const emitIntentSeek = useCallback(
+    (mediaTime: number) => {
+      socketRef.current?.emit("intent_seek", { mediaTime });
     },
     []
   );
@@ -426,10 +477,13 @@ export function SocketProvider({ children }: { children: React.ReactNode }) {
         roomState,
         isHost,
         sessionId,
+        getCurrentServerTime,
         getServerTimeOffset,
         createRoom,
         joinRoom,
-        emitSyncAction,
+        emitIntentPlay,
+        emitIntentPause,
+        emitIntentSeek,
         emitTrackChanged,
         emitQueueAdd,
         emitPlayNext,

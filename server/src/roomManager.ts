@@ -27,6 +27,7 @@ export interface Room {
   currentVideoTitle: string | null;
   currentTime: number;
   isPlaying: boolean;
+  lastPlaybackServerTime: number; // server timestamp when playback state was last set
   queue: QueueItem[];
   guests: Map<string, Guest>; // socketId → Guest
   createdAt: Date;
@@ -97,6 +98,7 @@ export function createRoom(
     currentVideoTitle: null,
     currentTime: 0,
     isPlaying: false,
+    lastPlaybackServerTime: Date.now(),
     queue: [],
     guests: new Map(),
     createdAt: new Date(),
@@ -402,6 +404,7 @@ export function updatePlaybackState(
   if (room) {
     room.currentTime = currentTime;
     room.isPlaying = isPlaying;
+    room.lastPlaybackServerTime = Date.now();
   }
 }
 
